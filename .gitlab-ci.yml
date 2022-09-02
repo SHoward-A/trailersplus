@@ -1,0 +1,148 @@
+# This is trailersplus CI/CD process
+# Global means "For every job if another not specified"
+
+# Global containers image
+image: python:3.8
+
+# CI/CD stages
+stages:
+  - Build
+  - Static Analysis
+  - Test
+  - Release
+  - Deploy
+
+# ENV variables
+variables:
+  # PipEnv venv path
+  WORKON_HOME: .pipenv/venvs
+  # PipEnv cache path
+  PIPENV_CACHE_DIR: .pipenv/pipcache
+
+
+# Global cache
+cache: &global-cache
+  # Make cache individual for every branch
+  key: ${CI_COMMIT_REF_SLUG}
+  # Paths to cache
+  paths:
+    - .pipenv
+  # Only pull cache
+  policy: pull
+
+# Run before every script
+before_script:
+  - pip3 install --upgrade pip
+  - pip3 install pipenv
+  - cp $ENV_FILE trailersplus/trailersplus/settings/.env
+
+## Installing all dependencies and caching them
+#build:
+#  stage: Build
+#  script:
+#    - pipenv sync --dev
+#  # Override the global cache
+#  cache:
+#    <<: *global-cache
+#    # Add push policy to save result
+#    policy: pull-push
+#
+#
+## Check code style
+#flake8:
+#  stage: Static Analysis
+#  # Continue the pipeline even if flake8 failed
+#  allow_failure: true
+#  script:
+#    - pipenv run flake8 "trailersplus/"
+#
+## Static type checker
+#mypy:
+#  stage: Static Analysis
+#  # Continue the pipeline even if mypy failed
+#  allow_failure: true
+#  script:
+#    - pipenv run mypy "trailersplus/"
+#
+## Check if server is ready for deploy stage
+#django-check:
+#  stage: Static Analysis
+#  # Continue the pipeline even if django-check failed
+#  allow_failure: true
+#  script:
+#    - if pipenv run python trailersplus/manage.py check --deploy |grep "System check identified no issues (0 silenced)."; then echo Success; else exit 1; fi
+#
+#
+## Unit testing stage
+#test:
+#  stage: Test
+#  # Runs immediately after django-check job and not waiting while the whole stage ends
+#  needs: ["django-check"]
+#  script:
+#    - pipenv run coverage run --rcfile="setup.cfg" trailersplus/manage.py test
+#    - pipenv run coverage report
+#
+#  # RegEx to find coverage percentage
+#  coverage: '/^TOTAL.+?(\d+\%)$/'
+
+# Release every commit from master branch to repo registry as "latest"
+release:
+  stage: Release
+
+  image: docker:latest
+  only:
+    - master
+    - tags
+  services:
+    - docker:dind
+  variables:
+    DOCKER_DRIVER: "overlay"
+
+  # Disable cache
+  cache: {}
+
+  before_script:
+    - cp $ENV_FILE trailersplus/trailersplus/settings/.env
+    - mkdir trailersplus/trailersplus/certs
+    - mkdir trailersplus/trailersplus/certs/psql
+    - mkdir trailersplus/trailersplus/certs/redis
+    - cp $PSQL_CLIENT_CERT trailersplus/trailersplus/certs/psql/client-cert.pem
+    - cp $PSQL_CLIENT_KEY trailersplus/trailersplus/certs/psql/client-key.pem
+    - cp $PSQL_SERVER_CA trailersplus/trailersplus/certs/psql/server-ca.pem
+    - cp $AIVEN_CA trailersplus/trailersplus/certs/redis/aiven_ca.pem
+    - chmod 0600 trailersplus/trailersplus/certs/psql/client-cert.pem
+    - chmod 0600 trailersplus/trailersplus/certs/psql/client-key.pem
+    - chmod 0600 trailersplus/trailersplus/certs/psql/server-ca.pem
+    - chmod 0600 trailersplus/trailersplus/certs/redis/aiven_ca.pem
+    - docker version
+    - "docker info"
+    - "docker login -u gitlab-ci-token -p $CI_BUILD_TOKEN $CI_REGISTRY"
+  script:
+    - "docker build -t ${CI_REGISTRY}/upqode-wp/trailersplus-backend:latest -f docker/Dockerfile --pull ."
+    - "docker push ${CI_REGISTRY}/upqode-wp/trailersplus-backend:latest"
+  after_script:
+    - "docker logout ${CI_REGISTRY}"
+
+# Deploy every commit on the master branch to staging server
+deploy:
+  stage: Deploy
+
+  only:
+    - master
+    - tags
+  services:
+    - docker:dind
+  # Disable cache
+  cache: {}
+
+  before_script:
+    - apt-get update -qq
+    - apt-get install sshpass
+    - cp $COMPOSE_ENV_FILE ./docker/.env
+  script:
+    # Copy compose.env file, sql init file and docker-compose.yml to deploy server
+    - sshpass -p "${SERVER_PASS}" scp -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no ./docker/.env ${SERVER_USER}@${SERVER_IP}:~/.env
+    - sshpass -p "${SERVER_PASS}" scp -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no ./docker/docker_postgres.sh ${SERVER_USER}@${SERVER_IP}:~/docker_postgres.sh
+    - sshpass -p "${SERVER_PASS}" scp -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no ./docker/docker-compose.deploy.yml ${SERVER_USER}@${SERVER_IP}:~/docker-compose.yml
+    # Login to Docker Registry → Stop running docker compose containers → remove them → pull "latest" version from the registry → run docker compose → apply migrations to db → collect static files
+    - sshpass -p "${SERVER_PASS}" ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no ${SERVER_USER}@${SERVER_IP} "echo ${SERVER_PASS} | sudo -S ls && docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}; sudo docker-compose stop; sudo docker-compose rm --force web; sudo docker pull ${CI_REGISTRY}/upqode-wp/trailersplus-backend:latest; sudo docker-compose up -d; sudo docker-compose run web pipenv run python manage.py makemigrations --noinput; sudo docker-compose run web pipenv run python manage.py migrate --noinput; sudo docker-compose run web pipenv run python manage.py collectstatic --noinput"
